@@ -1,0 +1,6 @@
+# Intel's firmware must not be committed
+*.bin
+*.cab
+__pycache__/
+*.orig
+*.rej

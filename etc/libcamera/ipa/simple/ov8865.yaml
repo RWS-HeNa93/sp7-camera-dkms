@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# libcamera "simple" (software ISP) tuning for the Surface Pro 7 rear camera.
+# Without this file libcamera falls back to uncalibrated.yaml, which has no
+# colour correction, and the picture looks washed out.
+#
+# Colour matrix: NOT measured on this sensor. No calibration exists for it
+# (the Windows driver's OV8865_MSHW0191_ICL.cpf is an empty stub), so this is
+# the front camera's daylight matrix (ov5693.yaml, Intel light_source 6,
+# 6254 K). Both sensors are OmniVision OmniBSI-2 parts with 1.4 um pixels, and
+# the result looks natural here, but it is an approximation. One matrix for
+# every light on purpose: libcamera picks matrices by a colour temperature it
+# estimates from the white balance gains, and this sensor's gains differ from
+# the front one's in the same light (about 2.1/1.4 against 1.65/1.67 for
+# red/blue), so the front camera's temperature scale does not carry over.
+# A real calibration needs raw frames of a colour chart.
+#
+# Black level: measured with the ov8865 driver in use here on raw frames at
+# the shortest exposure: 16.3 of 1023 on average (15.6 to 17.0 depending on
+# the channel) at analogue gains from 1x to 16x, in both the 3264x2448 and
+# the 3264x1836 readout. libcamera wants it on a 16-bit scale and keeps only
+# 8 bits of it, so 1024 (= 16 of 1023) is as close as it gets. Left out,
+# libcamera starts from 4096 and only lowers it when the scene has enough
+# dark pixels.
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 1024
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 6254
+          ccm: [  1.5505, -0.3922, -0.1583,
+                 -0.2548,  1.6861, -0.4313,
+                 -0.0920, -0.4237,  1.5157 ]
+  - Adjust:
+  - Agc:
+...

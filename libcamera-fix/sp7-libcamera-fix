@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+"""Keep a corrected private copy of libcamera for WirePlumber.
+
+libcamera 0.7.2's GPU software ISP has two faults that show on the Surface
+Pro 7 cameras whenever the picture is scaled down from the sensor frame, which
+is nearly always. Both are still in libcamera 0.8.0 and master (2026-11-20).
+
+1. Shader. Some output pixels are read from the neighbour of the pixel the
+   Bayer colour is computed for, and the outermost pixels are read from past
+   the picture's edge. With a colour matrix loaded that shows as one-pixel
+   pink lines and a tinted border. The fragment shader is stored as plain text
+   inside libcamera.so; it is replaced by a corrected one of the same length
+   (~/.local/share/sp7-libcamera/bayer_unpacked.frag.{stock,fixed}).
+
+2. Statistics window. DebayerEGL::configure() hands the statistics code a
+   window of the *output* size at the top left corner of the sensor frame
+   (stats_->setWindow(Rectangle(window_.size()))), so white balance, exposure
+   and black level are worked out from that corner only: 35% of the frame for
+   a 1920x1080 picture from the rear camera's 3264x1836 mode. Whatever is in
+   that corner gets averaged to grey (a hand there loses its colour, a wooden
+   table there turns everything else blue). The machine code that builds the
+   rectangle is replaced by code of the same length that passes the size of
+   the whole sensor frame. That patch is tied to this exact build of the
+   library: the bytes are looked for and must be found exactly once.
+
+The CPU software ISP has neither fault but cannot scale: it cuts the picture
+from the middle of the sensor frame (zoomed in).
+
+The same two changes as source patches are in the libcamera-fix folder of the
+sp7-camera-dkms repository.
+
+This script copies the installed library to ~/.local/lib/libcamera-sp7/ with
+the fixes applied. WirePlumber, which runs the cameras for applications, loads
+the copy through LD_LIBRARY_PATH (see
+~/.config/systemd/user/wireplumber.service.d/sp7-libcamera.conf, which also
+runs this script before every start). The system library is never modified.
+
+If the installed library changes, the copy is rebuilt from it with whichever
+of the fixes still match. If none matches (a different libcamera version), the
+copy is removed and WirePlumber uses the system library as usual.
+
+usage: sp7-libcamera-fix [--status]
+"""
+import glob
+import hashlib
+import os
+import subprocess
+import sys
+
+HOME = os.path.expanduser('~')
+DATA = os.path.join(HOME, '.local/share/sp7-libcamera')
+OUT = os.path.join(HOME, '.local/lib/libcamera-sp7')
+STAMP = os.path.join(OUT, 'source.sha256')
+SHADER_ORIG = os.path.join(DATA, 'bayer_unpacked.frag.stock')
+SHADER_FIXED = os.path.join(DATA, 'bayer_unpacked.frag.fixed')
+LIB_DIRS = ('/usr/lib64', '/usr/lib/x86_64-linux-gnu', '/usr/lib')
+
+# DebayerEGL::configure() in libcamera-0.7.2-2.fc44.x86_64, just before the
+# call to SwStatsCpu::setWindow(); r12 = &inputCfg, r13 = &outputCfg,
+# rbx = this, the Rectangle argument is at -0x240(%rbp).
+STATS_ORIG = bytes.fromhex(
+    '418b5510'                  # mov 0x10(%r13),%edx      outputCfg.size.width
+    '899334020000'              # mov %edx,0x234(%rbx)     window_.width
+    '418b4514'                  # mov 0x14(%r13),%eax      outputCfg.size.height
+    '48c785c0fdffff00000000'    # movq $0,-0x240(%rbp)     rect.x, rect.y
+    '898338020000'              # mov %eax,0x238(%rbx)     window_.height
+    '8985ccfdffff'              # mov %eax,-0x234(%rbp)    rect.height
+    '8995c8fdffff')             # mov %edx,-0x238(%rbp)    rect.width
+STATS_FIXED = bytes.fromhex(
+    '498b4510'                  # mov 0x10(%r13),%rax      outputCfg.size
+    '48898334020000'            # mov %rax,0x234(%rbx)     window_ width+height
+    '498b442410'                # mov 0x10(%r12),%rax      inputCfg.size
+    '488985c8fdffff'            # mov %rax,-0x238(%rbp)    rect width+height
+    '48c785c0fdffff00000000'    # movq $0,-0x240(%rbp)     rect.x, rect.y
+    '660f1f840000000000')       # 9-byte nop
+
+
+def fixes():
+    """(name, original bytes, replacement of the same length) for each fix."""
+    with open(SHADER_ORIG, 'rb') as fh:
+        orig = fh.read()
+    with open(SHADER_FIXED, 'rb') as fh:
+        fixed = fh.read().rstrip(b'\n') + b'\n'
+    if len(fixed) <= len(orig):
+        fixed += b'\n' * (len(orig) - len(fixed))
+    return [('shader', orig, fixed),
+            ('statistics window', STATS_ORIG, STATS_FIXED)]
+
+
+def soname(path):
+    out = subprocess.run(['readelf', '-d', path], capture_output=True,
+                         text=True).stdout
+    for line in out.splitlines():
+        if '(SONAME)' in line and '[' in line:
+            return line.split('[', 1)[1].split(']', 1)[0]
+    return None
+
+
+def clear():
+    if os.path.isdir(OUT):
+        for name in os.listdir(OUT):
+            os.remove(os.path.join(OUT, name))
+
+
+def main():
+    status_only = '--status' in sys.argv[1:]
+
+    # the first of the usual library folders that has it
+    # (Fedora, Debian/Ubuntu, Arch)
+    libs = []
+    for d in LIB_DIRS:
+        libs = [p for p in glob.glob(os.path.join(d, 'libcamera.so.*'))
+                if not os.path.islink(p)]
+        if libs:
+            break
+    if len(libs) != 1:
+        if not status_only:
+            clear()
+        print(f"expected one libcamera library, found {libs}; not patching")
+        return 0
+    lib = libs[0]
+
+    with open(lib, 'rb') as fh:
+        data = fh.read()
+    todo = fixes()
+    # the stamp covers the library and the fixes, so that a change to either
+    # rebuilds the copy
+    digest = hashlib.sha256(data)
+    for _, orig, fixed in todo:
+        digest.update(orig + fixed)
+    digest = digest.hexdigest()
+    name = soname(lib)
+    usable = [f for f in todo
+              if len(f[1]) == len(f[2]) and data.count(f[1]) == 1]
+
+    current = None
+    if os.path.exists(STAMP):
+        with open(STAMP) as fh:
+            current = fh.read().strip()
+    have = name and os.path.exists(os.path.join(OUT, name))
+
+    if status_only:
+        state = ('up to date' if have and current == digest else
+                 'out of date or missing')
+        names = ', '.join(f[0] for f in usable) or 'none'
+        print(f"{lib}: fixes that apply: {names}; private copy: {state}")
+        return 0
+
+    if have and current == digest:
+        return 0
+
+    if not name or not usable:
+        clear()
+        print(f"{lib} contains none of the code these fixes are for; "
+              "using the system library unchanged")
+        return 0
+
+    patched = data
+    for _, orig, fixed in usable:
+        patched = patched.replace(orig, fixed)
+    # same length, so nothing else in the file moves
+    assert len(patched) == len(data)
+
+    os.makedirs(OUT, exist_ok=True)
+    clear()
+    tmp = os.path.join(OUT, name + '.tmp')
+    with open(tmp, 'wb') as fh:
+        fh.write(patched)
+    os.chmod(tmp, 0o755)
+    os.rename(tmp, os.path.join(OUT, name))
+    with open(STAMP, 'w') as fh:
+        fh.write(digest + '\n')
+    skipped = [f[0] for f in todo if f not in usable]
+    print(f"patched copy of {lib} written to {os.path.join(OUT, name)} "
+          f"({', '.join(f[0] for f in usable)})"
+          + (f"; not found in this library: {', '.join(skipped)}"
+             if skipped else ''))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

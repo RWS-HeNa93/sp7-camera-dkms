@@ -1,0 +1,85 @@
+From 00ba45c6d4bca358dd7e931437b3a9a3a4c6ff34 Mon Sep 17 00:00:00 2001
+From: Ruslan Bay <ruslanbey@proton.me>
+Date: Sat, 31 Oct 2026 06:57:24 +0000
+Subject: [RFC PATCH v2 00/12] media: ipu6: Add support for IPU4P hardware
+
+This series adds IPU4P support to the upstream IPU6/IPU7 driver.
+The IPU4 family includes IPU4 (Apollo Lake) and IPU4P (Ice Lake);
+this series supports IPU4P only.
+
+Most of the groundwork was done by Antti Laakso in the IPU7 support
+series [1]. I added the IPU4P-specific parts, using Intel's downstream
+driver as a reference [2]. The code mostly generated using AI.
+
+Image capture was tested on a Surface Pro 7 (i5-1035G4) with
+both the front OV5693 and rear OV8865 cameras. Test logs: [3]
+
+Thanks to the linux-surface community and the libcamera developers for
+testing the downstream driver and sharing their findings.
+
+Changes since v1:
+
+- Addressed review feedback on:
+  - IPU4P buttress handling and register definitions
+  - Firmware ABI declarations and structure layout
+  - ISYS interrupt setup and handling
+- Simplified the Surface Pro 7 CSI-2 timing workaround.
+- Further refactored the IPU4P implementation to better align with
+  the existing IPU6/7/8 driver codebase.
+
+Links:
+[1] https://lore.kernel.org/all/20260907113004.2489993-1-sakari.ailus@linux.intel.com/
+[2] https://github.com/intel/linux-intel-lts/tree/lts-v5.15.195-android_t-251103T063840Z/drivers/media/pci/intel
+[3] https://github.com/ruslanbay/ipu4-drivers/tree/3c7c0b623f99a90b32c50691195612172be30822/assets
+
+Ruslan Bay (12):
+  media: ipu6: Add IPU4P hardware identification
+  media: ipu6: Add IPU4P MMU support
+  media: ipu6: Add IPU4P buttress support
+  media: ipu6: Add IPU4P ISYS firmware ABI definitions
+  media: ipu6: Support DMEM-based SysCom in ipu6-fw-com
+  media: ipu6: Add firmware-specific ISYS response dispatch
+  media: ipu6: Add IPU4P ISYS firmware operations
+  media: ipu6: Add IPU4P CSI-2 register definitions
+  media: ipu6: Add IPU4P ISYS ISR handling
+  media: ipu6: Add IPU4P CSI PHY driver
+  media: ipu6: Fix Surface Pro 7 CSI-2 capture timing
+  media: ipu6: Enable IPU4P PCI device
+
+ drivers/media/pci/intel/ipu6/Kconfig          |   8 +-
+ drivers/media/pci/intel/ipu6/Makefile         |   2 +
+ drivers/media/pci/intel/ipu6/ipu4p-fw-isys.c  | 996 ++++++++++++++++++
+ drivers/media/pci/intel/ipu6/ipu4p-fw-isys.h  | 406 +++++++
+ .../media/pci/intel/ipu6/ipu4p-isys-csi-phy.c | 225 ++++
+ .../pci/intel/ipu6/ipu4p-isys-csi2-regs.h     |  72 ++
+ drivers/media/pci/intel/ipu6/ipu6-bus.h       |   1 +
+ drivers/media/pci/intel/ipu6/ipu6-buttress.c  |  59 +-
+ drivers/media/pci/intel/ipu6/ipu6-fw-com.c    |  48 +-
+ drivers/media/pci/intel/ipu6/ipu6-fw-com.h    |   3 +
+ drivers/media/pci/intel/ipu6/ipu6-fw-isys.c   |  64 +-
+ drivers/media/pci/intel/ipu6/ipu6-fw-isys.h   |   4 +-
+ drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c | 103 +-
+ drivers/media/pci/intel/ipu6/ipu6-isys-csi2.h |   2 +
+ .../media/pci/intel/ipu6/ipu6-isys-queue.c    |  36 +-
+ .../media/pci/intel/ipu6/ipu6-isys-video.c    |  12 +-
+ drivers/media/pci/intel/ipu6/ipu6-isys.c      | 136 ++-
+ drivers/media/pci/intel/ipu6/ipu6-isys.h      |  36 +
+ drivers/media/pci/intel/ipu6/ipu6-mmu-hw.c    | 114 +-
+ drivers/media/pci/intel/ipu6/ipu6-mmu.c       |   7 +-
+ drivers/media/pci/intel/ipu6/ipu6-mmu.h       |   1 +
+ .../intel/ipu6/ipu6-platform-buttress-regs.h  |  30 +
+ .../media/pci/intel/ipu6/ipu6-platform-regs.h |  14 +
+ drivers/media/pci/intel/ipu6/ipu6.c           |  49 +
+ drivers/media/pci/intel/ipu6/ipu6.h           |  20 +-
+ include/media/ipu6-pci-table.h                |   2 +
+ 26 files changed, 2361 insertions(+), 89 deletions(-)
+ create mode 100644 drivers/media/pci/intel/ipu6/ipu4p-fw-isys.c
+ create mode 100644 drivers/media/pci/intel/ipu6/ipu4p-fw-isys.h
+ create mode 100644 drivers/media/pci/intel/ipu6/ipu4p-isys-csi-phy.c
+ create mode 100644 drivers/media/pci/intel/ipu6/ipu4p-isys-csi2-regs.h
+
+
+base-commit: 27285b099fbc5cb2ae3aef20f3bbd7b3c88b3005
+-- 
+2.56.0
+

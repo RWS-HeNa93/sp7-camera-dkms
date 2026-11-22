@@ -1,0 +1,43 @@
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e94..3bed425 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -21,6 +21,8 @@ precision highp float;
+ 
+ /** Monochrome RGBA or GL_LUMINANCE Bayer encoded texture.*/
+ uniform sampler2D       tex_y;
++uniform vec2            tex_size;
++uniform vec2            tex_bayer_first_red;
+ varying vec4            center;
+ varying vec4            yCoord;
+ varying vec4            xCoord;
+@@ -42,14 +44,26 @@ float apply_contrast(float value)
+ void main(void) {
+     vec3 rgb;
+ 
++    // Read every tap from the centre of the pixel that floor(center.zw)
++    // selects. With a scaled output the interpolated coordinate can lie
++    // within rounding distance of a pixel boundary, and the texture fetch
++    // then returns the neighbour of the pixel that 'alternate' is computed
++    // for: a line of wrong-coloured pixels. For the two outermost pixels use
++    // the pixel two further in instead of reading past the edge, which gave
++    // a wrong-coloured border.
++    vec2 pix = floor(center.zw - tex_bayer_first_red);
++    vec2 snap = (0.5 - fract(center.zw) +
++                 2.0 * (step(pix, vec2(1.5)) - step(tex_size - 2.5, pix))) *
++                vec2(xCoord[2] - center.x, yCoord[2] - center.y);
++
+     #if defined(RAW10P)
+     #define pixel(p) p.r / 4.0 + p.g * 64.0
+-    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
++    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y) + snap))
+     #elif defined(RAW12P)
+     #define pixel(p) p.r / 16.0 + p.g * 16.0
+-    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
++    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y) + snap))
+     #else
+-    #define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
++    #define fetch(x, y) texture2D(tex_y, vec2(x, y) + snap).r
+     #endif
+ 
+     float C = fetch(center.x, center.y); // ( 0, 0)

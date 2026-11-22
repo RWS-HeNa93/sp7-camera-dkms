@@ -1,0 +1,149 @@
+dw9719: fixed default focus and optional device node (Surface Pro 7 rear lens)
+
+default_focus=N    Lens position (0-1023) the driver moves to every time the
+                   lens powers up; -1 (default) leaves the focus control alone.
+focus_overshoot=N  On power-up, drive the lens N past its position first and
+                   come back down to it. A position just above the point where
+                   the lens lifts off its rest stop is otherwise not
+                   repeatable (0, the default, keeps the stock ramp).
+devnode=0          Registers the lens without a V4L2 device node, so that
+                   libcamera does not open it and keep it (and through the
+                   ipu-bridge device link its sensor) powered for as long as
+                   WirePlumber runs. The sensor driver powers the lens instead
+                   (ov8865 vcm=1).
+
+Note: the stock power-up ramp stops one step (16) short of the position; with
+focus_overshoot the lens ends exactly on it.
+
+Base:    linux-surface/kernel, branch v7.3-surface, drivers/media/i2c/dw9719.c
+         as of commit d6aaeeec414a ("media: i2c: dw9719: fix probe error on
+         surface go 2"), the file kernel-surface 7.3.4-2 was built from
+         (SHA-256 bf4477b809e1f48a5e9f14d2b564cc9df5564a9e0f54b164927afb63511d8645)
+Local:   all three module parameters (the default focus idea is surface-kit's
+         dw9719 default_focus parameter; here it is applied on every power-up
+         and can be changed at run time)
+
+--- a/drivers/media/i2c/dw9719.c
++++ b/drivers/media/i2c/dw9719.c
+@@ -23,6 +23,39 @@
+ #define DW9719_CTRL_STEPS	16
+ #define DW9719_CTRL_DELAY_US	1000
+ 
++/*
++ * default_focus: lens position (0-1023) to move to every time the lens powers
++ * up; -1 leaves the focus control alone. libcamera's software ISP pipeline
++ * has no autofocus, so with it the lens stays wherever it starts.
++ *
++ * devnode=0 registers the lens without a V4L2 device node. libcamera opens
++ * every lens it finds a node for and keeps it open for as long as its camera
++ * manager lives (in WirePlumber: the whole session), which keeps the lens and,
++ * through the ipu-bridge device link, its sensor powered all that time.
++ * Without a node the lens is only powered by the sensor driver while the
++ * sensor streams (ov8865 vcm=1).
++ */
++static int default_focus = -1;
++module_param(default_focus, int, 0644);
++MODULE_PARM_DESC(default_focus, "lens position (0-1023) applied whenever the lens powers up (-1 = leave the control alone)");
++
++static bool devnode = true;
++module_param(devnode, bool, 0444);
++MODULE_PARM_DESC(devnode, "register a V4L2 device node for the lens");
++
++/*
++ * focus_overshoot: on power-up, first drive the lens this far past its
++ * position and then come back down to it. A position just above the point
++ * where the lens lifts off its rest stop is otherwise not repeatable: driven
++ * straight up to it, the lens sometimes sticks short of it (Surface Pro 7
++ * rear camera: 3 of 8 starts out of focus at the same value).
++ */
++static int focus_overshoot;
++module_param(focus_overshoot, int, 0644);
++MODULE_PARM_DESC(focus_overshoot, "on power-up, go this far past the lens position first (0 = off)");
++
++#define DW9719_OVERSHOOT_HOLD_US	30000
++
+ #define DW9718S_PD			CCI_REG8(0)
+ 
+ #define DW9718S_CONTROL			CCI_REG8(1)
+@@ -262,6 +295,28 @@
+ 	.s_ctrl = dw9719_set_ctrl,
+ };
+ 
++/* Move the lens from one position to another in steps it can follow. */
++static int dw9719_ramp(struct dw9719_device *dw9719, int from, int to)
++{
++	int val = from;
++	int ret;
++
++	while (val != to) {
++		if (abs(to - val) <= DW9719_CTRL_STEPS)
++			val = to;
++		else
++			val += to > val ? DW9719_CTRL_STEPS : -DW9719_CTRL_STEPS;
++
++		ret = dw9719_t_focus_abs(dw9719, val);
++		if (ret)
++			return ret;
++
++		usleep_range(DW9719_CTRL_DELAY_US, DW9719_CTRL_DELAY_US + 10);
++	}
++
++	return 0;
++}
++
+ static int dw9719_suspend(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+@@ -285,7 +340,7 @@
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct dw9719_device *dw9719 = to_dw9719_device(sd);
+-	int current_focus = dw9719->ctrls.focus->val;
++	int current_focus;
+ 	int ret;
+ 	int val;
+ 
+@@ -293,6 +348,33 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Only the control's value changes here: dw9719_set_ctrl() does not
++	 * write to the lens while the device is still resuming. The ramp
++	 * below moves it.
++	 */
++	if (default_focus >= 0)
++		v4l2_ctrl_s_ctrl(dw9719->ctrls.focus,
++				 min(default_focus, DW9719_MAX_FOCUS_POS));
++	current_focus = dw9719->ctrls.focus->val;
++
++	if (focus_overshoot > 0 && current_focus > 0) {
++		int peak = min(current_focus + focus_overshoot,
++			       DW9719_MAX_FOCUS_POS);
++
++		ret = dw9719_ramp(dw9719, 0, peak);
++		if (ret)
++			goto err_power_down;
++
++		fsleep(DW9719_OVERSHOOT_HOLD_US);
++
++		ret = dw9719_ramp(dw9719, peak, current_focus);
++		if (ret)
++			goto err_power_down;
++
++		return 0;
++	}
++
+ 	for (val = current_focus % DW9719_CTRL_STEPS; val < current_focus;
+ 	     val += DW9719_CTRL_STEPS) {
+ 		ret = dw9719_t_focus_abs(dw9719, val);
+@@ -376,7 +458,8 @@
+ 				     "getting regulator\n");
+ 
+ 	v4l2_i2c_subdev_init(&dw9719->sd, client, &dw9719_ops);
+-	dw9719->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	if (devnode)
++		dw9719->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	dw9719->sd.internal_ops = &dw9719_internal_ops;
+ 
+ 	ret = dw9719_init_controls(dw9719);

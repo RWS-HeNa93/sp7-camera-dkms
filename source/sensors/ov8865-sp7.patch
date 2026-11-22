@@ -1,0 +1,245 @@
+ov8865: Surface Pro 7 rear camera options (mirror, lens power) and
+auto-exposure fixes
+
+mirror=1  On the Surface Pro 7 the picture libcamera gets from this sensor is
+          reversed left to right. This inverts the horizontal flip in the
+          driver. The Bayer order stays SBGGR in every mode and flip state.
+vcm=1     Keeps the lens VCM ("<sensor>-VCM", driver dw9719) powered while the
+          sensor streams, so that its driver holds the lens at its default
+          focus position. libcamera's software ISP pipeline has no autofocus
+          and never powers the lens, which otherwise sits parked, out of focus.
+
+Auto-exposure (always on, no parameter). Without the gain step and exposure
+range changes libcamera's software ISP never raises the analogue gain above
+the 1x the driver starts with, and every scene that is not brightly lit
+comes out dark and grey:
+gain step The analogue gain control moved in whole multiples only (step 128
+          = 1x). libcamera changes the gain by a few percent at a time, which
+          the control rounded back to the old value. Now step 1 (1/128).
+gain max  The control went up to 2048, but the gain is linear only up to 2047
+          (just under 16x); 2048 gives the picture of 1024 (8x), measured on
+          raw frames. With fine steps auto-exposure reaches the maximum in
+          dim light, and the picture fell back to half its brightness there.
+          Now 2047.
+exposure  A format change announced an exposure range for the mode's nominal
+range     frame length, but keeps the current VBLANK (22 lines from the
+          full-size mode the driver starts in), and applying VBLANK at stream
+          start set the range anew: 1850 lines for 3264x1836, not the 2462
+          announced. libcamera only turns to the gain once the exposure has
+          reached the announced maximum. Now the range announced is the one
+          that applies. Frame timing is unchanged (3264x1836 at 20 fps).
+start     libcamera's auto-exposure is slow on this sensor (about 15% per
+values    second) and control values only last until the next boot. The
+          driver started at 32 lines and 1x gain, so a room in lamp light
+          stayed dark for more than half a minute at the first use after
+          every boot. Now it starts with the whole frame as exposure time,
+          as ov5693 does, and keeps a whole-frame exposure one across format
+          changes (libcamera tries every mode when it starts, which
+          otherwise leaves the exposure at 614 lines, the limit of 800x600),
+          and with the gain in the middle of its range (4x).
+
+Base:    linux-surface/kernel, branch v7.3-surface, drivers/media/i2c/ov8865.c
+         as of commit f4cdf7ca9a1f; identical to stable v7.3.4, the file
+         kernel-surface 7.3.4-2 was built from
+         (SHA-256 4d6aef225d85ba37ff903e60869ec0bb2dfbab6a5cca27bb2ddbefc40b3c0336)
+Ported:  gain step: rylos/kernel, branch sp5-ipu3-cameras, commit 7dc915febac6
+         "ov8865: Allow fine analogue gain steps" (linux-surface/kernel#181)
+Local:   both module parameters, off by default (the mirror idea is
+         surface-kit's ov8865 invert-hflip parameter); gain maximum,
+         exposure range and start values. The same series solves the range
+         mismatch differently, by resetting VBLANK to the mode default on
+         every format change (ff6a914206fd); tried here, it slows 3264x1836
+         from 20 to 15 fps.
+
+--- a/drivers/media/i2c/ov8865.c
++++ b/drivers/media/i2c/ov8865.c
+@@ -703,6 +703,9 @@
+ 
+ 	struct ov8865_state state;
+ 	struct ov8865_ctrls ctrls;
++
++	/* lens VCM kept powered while streaming, see ov8865_vcm_start() */
++	struct device *vcm;
+ };
+ 
+ /* Static definitions */
+@@ -2198,11 +2201,25 @@
+ 				  enable ? bits : 0);
+ }
+ 
++/*
++ * mirror=1 inverts whatever horizontal flip user space asks for, so that the
++ * picture comes out flipped left to right in every application. libcamera
++ * always requests the orientation the firmware reports and offers no setting
++ * for this. The Bayer order stays SBGGR in every mode and flip state (checked
++ * on raw frames on a Surface Pro 7). Applied on the next stream start:
++ *	modprobe ov8865 mirror=1
++ */
++static bool mirror;
++module_param(mirror, bool, 0644);
++MODULE_PARM_DESC(mirror, "invert the horizontal flip (picture flipped left to right)");
++
+ static int ov8865_flip_horz_configure(struct ov8865_sensor *sensor, bool enable)
+ {
+ 	u8 bits = OV8865_FORMAT2_FLIP_HORZ_ISP_EN |
+ 		  OV8865_FORMAT2_FLIP_HORZ_SENSOR_EN;
+ 
++	enable ^= mirror;
++
+ 	return ov8865_update_bits(sensor, OV8865_FORMAT2_REG, bits,
+ 				  enable ? bits : 0);
+ }
+@@ -2523,13 +2540,34 @@
+ 
+ 	/* Exposure */
+ 
++	/*
++	 * Start with the whole frame as exposure time, as ov5693 does, instead
++	 * of 32 lines, and with the gain in the middle of its range (4x)
++	 * instead of 1x. libcamera's auto-exposure moves by roughly 15% per
++	 * second on this sensor, and control values only last until the next
++	 * boot: from 32 lines at 1x a room in lamp light stayed dark for more
++	 * than half a minute at the first use after every boot.
++	 */
+ 	ctrls->exposure = v4l2_ctrl_new_std(handler, ops, V4L2_CID_EXPOSURE, 2,
+-					    65535, 1, 32);
++					    mode->vts -
++					    OV8865_INTEGRATION_TIME_MARGIN, 1,
++					    mode->vts -
++					    OV8865_INTEGRATION_TIME_MARGIN);
+ 
+ 	/* Gain */
+ 
+-	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2048, 128,
+-			  128);
++	/*
++	 * The register takes the gain in 1/128 units. With a step of 128 (whole
++	 * multiples only) libcamera's auto-exposure, which changes the gain by
++	 * a few percent at a time, is rounded back to where it was and never
++	 * leaves 1x: dim scenes stay dark.
++	 *
++	 * The maximum is 2047, not 2048: the gain is linear up to 2047 (just
++	 * under 16x), while 2048 gives the picture of 1024 (8x), measured on
++	 * raw frames. Auto-exposure runs into the maximum in dim light.
++	 */
++	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2047, 1,
++			  512);
+ 
+ 	/* White Balance */
+ 
+@@ -2604,6 +2642,51 @@
+ 
+ /* Subdev Video Operations */
+ 
++/*
++ * Lens. With vcm=1 the VCM that ipu-bridge created for this sensor
++ * ("<sensor>-VCM") is kept powered for as long as the sensor streams, and its
++ * driver moves the lens to its default position (dw9719 default_focus).
++ * Nothing else does that on the Surface Pro 7: libcamera's software ISP
++ * pipeline has no autofocus and the lens has no device node for it to open, so
++ * the VCM stays off and the lens sits parked, out of focus.
++ *
++ * Best effort: without a bound VCM driver the sensor streams as before.
++ */
++static bool vcm;
++module_param(vcm, bool, 0644);
++MODULE_PARM_DESC(vcm, "power the lens VCM while the sensor streams");
++
++static void ov8865_vcm_start(struct ov8865_sensor *sensor)
++{
++	struct device *dev;
++	char name[64];
++
++	if (!vcm || sensor->vcm)
++		return;
++
++	snprintf(name, sizeof(name), "%s-VCM", dev_name(sensor->dev));
++	dev = bus_find_device_by_name(&i2c_bus_type, NULL, name);
++	if (!dev)
++		return;
++
++	if (pm_runtime_resume_and_get(dev) < 0) {
++		put_device(dev);
++		return;
++	}
++
++	sensor->vcm = dev;
++}
++
++static void ov8865_vcm_stop(struct ov8865_sensor *sensor)
++{
++	if (!sensor->vcm)
++		return;
++
++	pm_runtime_put_autosuspend(sensor->vcm);
++	put_device(sensor->vcm);
++	sensor->vcm = NULL;
++}
++
+ static int ov8865_s_stream(struct v4l2_subdev *subdev, int enable)
+ {
+ 	struct ov8865_sensor *sensor = ov8865_subdev_sensor(subdev);
+@@ -2636,6 +2719,11 @@
+ 
+ 	mutex_unlock(&sensor->mutex);
+ 
++	if (!ret && enable)
++		ov8865_vcm_start(sensor);
++	else if (!enable)
++		ov8865_vcm_stop(sensor);
++
+ 	if (ret || !enable)
+ 		pm_runtime_put(sensor->dev);
+ 
+@@ -2711,6 +2799,7 @@
+ 	u32 mbus_code = 0;
+ 	unsigned int hblank;
+ 	unsigned int index;
++	bool exposure_full;
+ 	int exposure_max;
+ 	int ret = 0;
+ 
+@@ -2759,13 +2848,34 @@
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.hblank, hblank, hblank, 1,
+ 				 hblank);
+ 
+-	exposure_max = mode->vts - OV8865_INTEGRATION_TIME_MARGIN;
++	/*
++	 * A format change keeps the current VBLANK value (22 lines from the
++	 * full-size mode the driver starts in, unless user space sets another),
++	 * so the frame is not mode->vts lines long, and applying VBLANK at
++	 * stream start set the exposure range anew: 1850 lines for 3264x1836,
++	 * not the 2462 announced here. libcamera's auto-exposure only raises
++	 * the gain once the exposure has reached the announced maximum, which
++	 * it then never did. Announce the range that will apply.
++	 */
++	exposure_max = mode->output_size_y + sensor->ctrls.vblank->val -
++		       OV8865_INTEGRATION_TIME_MARGIN;
++	exposure_full = sensor->ctrls.exposure->val >=
++			sensor->ctrls.exposure->maximum;
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.exposure,
+ 				 sensor->ctrls.exposure->minimum, exposure_max,
+ 				 sensor->ctrls.exposure->step,
+ 				 min(sensor->ctrls.exposure->val,
+ 				     exposure_max));
+ 
++	/*
++	 * An exposure of the whole frame stays one in the new mode. Otherwise
++	 * it is left at the length of the shortest frame that was ever set:
++	 * libcamera tries every mode when it starts, so the first stream after
++	 * a boot began at 614 lines, the limit of 800x600.
++	 */
++	if (exposure_full)
++		__v4l2_ctrl_s_ctrl(sensor->ctrls.exposure, exposure_max);
++
+ complete:
+ 	mutex_unlock(&sensor->mutex);
+ 
+@@ -3114,6 +3224,7 @@
+ 	struct v4l2_subdev *subdev = i2c_get_clientdata(client);
+ 	struct ov8865_sensor *sensor = ov8865_subdev_sensor(subdev);
+ 
++	ov8865_vcm_stop(sensor);
+ 	v4l2_async_unregister_subdev(subdev);
+ 	pm_runtime_disable(sensor->dev);
+ 	v4l2_ctrl_handler_free(&sensor->ctrls.handler);

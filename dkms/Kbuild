@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Out-of-tree build of the mainline intel-ipu6 driver with the IPU4P
+# (Ice Lake, PCI 8086:8a19) RFC v2 series applied. The two modules keep
+# their in-tree names so that they replace the stock ones.
+
+# The patched PCI ID table must win over the kernel's own copy.
+LINUXINCLUDE := -I$(src)/include $(LINUXINCLUDE)
+
+intel-ipu6-y			:= ipu6.o \
+				ipu6-bus.o \
+				ipu6-dma.o \
+				ipu6-mmu.o \
+				ipu6-mmu-hw.o \
+				ipu7-mmu-hw.o \
+				ipu6-buttress.o \
+				ipu6-cpd.o \
+				ipu6-fw-com.o \
+				ipu7-fw-com.o \
+				ipu7-boot.o
+
+obj-m				+= intel-ipu6.o
+
+intel-ipu6-isys-y		:= ipu6-isys.o \
+				ipu6-isys-csi2.o \
+				ipu4p-fw-isys.o \
+				ipu6-fw-isys.o \
+				ipu7-fw-isys.o \
+				ipu6-isys-video.o \
+				ipu6-isys-queue.o \
+				ipu6-isys-subdev.o \
+				ipu6-isys-mcd-phy.o \
+				ipu6-isys-jsl-phy.o \
+				ipu6-isys-dwc-phy.o \
+				ipu4p-isys-csi-phy.o \
+				ipu7-isys-csi-phy.o
+
+obj-m				+= intel-ipu6-isys.o
+
+# Camera sensors and the rear lens: the kernel's own ov5693 (front), ov8865
+# (rear) and dw9719 (rear lens VCM) drivers plus the Surface Pro 7 fixes in
+# source/sensors/<driver>-sp7.patch. They keep their in-tree names so that
+# they replace the stock modules.
+obj-m				+= ov5693.o
+obj-m				+= ov8865.o
+obj-m				+= dw9719.o
